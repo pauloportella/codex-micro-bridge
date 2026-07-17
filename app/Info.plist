@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>Codex Micro Bridge</string>
+  <key>CFBundleExecutable</key>
+  <string>codex-micro-menu</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.pauloportella.codex-micro-bridge</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>Codex Micro Bridge</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.4.0</string>
+  <key>CFBundleVersion</key>
+  <string>4</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>Codex Micro Bridge connects wirelessly to the M5StickC Plus2 and Zwift Ride controllers.</string>
+  <key>NSHumanReadableCopyright</key>
+  <string>Unofficial local Codex Micro Bridge</string>
+</dict>
+</plist>

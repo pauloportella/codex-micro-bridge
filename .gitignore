@@ -1,4 +1,6 @@
 .DS_Store
 .build/
+dist/
 firmware/leonardo/.pio/
+firmware/m5stickc/.pio/
 config/my-controller.json

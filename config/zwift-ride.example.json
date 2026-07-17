@@ -1,4 +1,10 @@
 {
+  "companionEnabled": true,
+  "companionMappings": [
+    { "button": "a", "action": { "type": "toggle", "key": "ACT10" } },
+    { "button": "b", "action": { "type": "press", "key": "ACT07" } },
+    { "button": "power", "action": { "type": "press", "key": "ACT08" } }
+  ],
   "mappings": [
     { "button": "navigationUp", "action": { "type": "key", "key": "AG00" } },
     { "button": "navigationDown", "action": { "type": "key", "key": "AG01" } },
@@ -15,7 +21,7 @@
     { "button": "powerUpLeft", "action": { "type": "turn", "direction": "ccw" } },
     { "button": "powerUpRight", "action": { "type": "turn", "direction": "cw" } },
     { "button": "onOffLeft", "action": { "type": "key", "key": "ENC" } },
-    { "button": "onOffRight", "action": { "type": "key", "key": "MIC" } },
+    { "button": "onOffRight", "action": { "type": "key", "key": "ACT10" } },
     { "button": "paddleLeft", "action": { "type": "turn", "direction": "ccw" } },
     { "button": "paddleRight", "action": { "type": "turn", "direction": "cw" } }
   ]

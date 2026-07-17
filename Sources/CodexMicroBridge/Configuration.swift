@@ -38,13 +38,48 @@ public struct RideMapping: Codable, Equatable {
   }
 }
 
+public struct CompanionMapping: Codable, Equatable {
+  public let button: String
+  public let action: CodexAction
+
+  public init(button: String, action: CodexAction) {
+    self.button = button
+    self.action = action
+  }
+}
+
 public struct RideConfig: Codable, Equatable {
   public let serialPort: String?
+  public let companionEnabled: Bool
   public let mappings: [RideMapping]
+  public let companionMappings: [CompanionMapping]
 
-  public init(serialPort: String? = nil, mappings: [RideMapping]) {
+  public init(
+    serialPort: String? = nil,
+    companionEnabled: Bool = false,
+    mappings: [RideMapping],
+    companionMappings: [CompanionMapping] = []
+  ) {
     self.serialPort = serialPort
+    self.companionEnabled = companionEnabled
     self.mappings = mappings
+    self.companionMappings = companionMappings
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case serialPort
+    case companionEnabled
+    case mappings
+    case companionMappings
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    serialPort = try container.decodeIfPresent(String.self, forKey: .serialPort)
+    companionEnabled = try container.decodeIfPresent(Bool.self, forKey: .companionEnabled) ?? false
+    mappings = try container.decode([RideMapping].self, forKey: .mappings)
+    companionMappings =
+      try container.decodeIfPresent([CompanionMapping].self, forKey: .companionMappings) ?? []
   }
 
   public func validated() throws -> RideConfig {
@@ -54,7 +89,6 @@ public struct RideConfig: Codable, Equatable {
     if let serialPort, serialPort.isEmpty {
       throw BridgeError("Zwift Ride serialPort must be a non-empty string")
     }
-
     var seen = Set<String>()
     for (offset, mapping) in mappings.enumerated() {
       let position = offset + 1
@@ -76,6 +110,30 @@ public struct RideConfig: Codable, Equatable {
         !["cw", "ccw"].contains(mapping.action.direction?.lowercased() ?? "")
       {
         throw BridgeError("Mapping \(position) turn direction must be cw or ccw")
+      }
+    }
+
+    var seenCompanionButtons = Set<String>()
+    for (offset, mapping) in companionMappings.enumerated() {
+      let position = offset + 1
+      guard ["a", "b", "power"].contains(mapping.button) else {
+        throw BridgeError("M5StickC mapping \(position) has an unknown button: \(mapping.button)")
+      }
+      guard seenCompanionButtons.insert(mapping.button).inserted else {
+        throw BridgeError("M5StickC button is mapped more than once: \(mapping.button)")
+      }
+      guard ["key", "press", "toggle", "turn"].contains(mapping.action.type) else {
+        throw BridgeError("M5StickC mapping \(position) action must be key, press, toggle, or turn")
+      }
+      if ["key", "press", "toggle"].contains(mapping.action.type) {
+        guard let key = mapping.action.key, !key.isEmpty else {
+          throw BridgeError("M5StickC mapping \(position) requires a Codex key")
+        }
+      }
+      if mapping.action.type == "turn",
+        !["cw", "ccw"].contains(mapping.action.direction?.lowercased() ?? "")
+      {
+        throw BridgeError("M5StickC mapping \(position) turn direction must be cw or ccw")
       }
     }
     return self

@@ -89,10 +89,12 @@ public enum HardwarePorts {
 public final class HardwareTransport {
   public let port: String
   private var descriptor: Int32
+  private var feedbackSource: DispatchSourceRead?
+  private var feedbackBytes: [UInt8] = []
 
   public init(port configuredPort: String? = nil) throws {
     port = try HardwarePorts.resolve(configuredPort)
-    descriptor = Darwin.open(port, O_WRONLY | O_NOCTTY)
+    descriptor = Darwin.open(port, O_RDWR | O_NOCTTY | O_NONBLOCK)
     guard descriptor >= 0 else {
       throw BridgeError("Could not open \(port): \(String(cString: strerror(errno)))")
     }
@@ -121,10 +123,51 @@ public final class HardwareTransport {
     }
   }
 
+  public func startFeedback(
+    queue: DispatchQueue = DispatchQueue(label: "Codex Micro hardware feedback"),
+    onLine: @escaping (String) -> Void
+  ) {
+    guard feedbackSource == nil, descriptor >= 0 else { return }
+    let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: queue)
+    source.setEventHandler { [weak self] in
+      self?.readFeedback(onLine: onLine)
+    }
+    feedbackSource = source
+    source.resume()
+  }
+
+  public func replayFeedback() throws {
+    try write("REPLAY\n")
+  }
+
   public func close() {
     guard descriptor >= 0 else { return }
+    feedbackSource?.cancel()
+    feedbackSource = nil
     Darwin.close(descriptor)
     descriptor = -1
+  }
+
+  private func readFeedback(onLine: (String) -> Void) {
+    var buffer = [UInt8](repeating: 0, count: 512)
+    while descriptor >= 0 {
+      let count = Darwin.read(descriptor, &buffer, buffer.count)
+      if count > 0 {
+        feedbackBytes.append(contentsOf: buffer.prefix(count))
+        while let newline = feedbackBytes.firstIndex(of: 0x0a) {
+          var line = Array(feedbackBytes[..<newline])
+          feedbackBytes.removeFirst(newline + 1)
+          if line.last == 0x0d { line.removeLast() }
+          if let text = String(bytes: line, encoding: .utf8), !text.isEmpty {
+            onLine(text)
+          }
+        }
+        continue
+      }
+      if count < 0, errno == EINTR { continue }
+      if count < 0, errno == EAGAIN || errno == EWOULDBLOCK { return }
+      return
+    }
   }
 
   private func write(_ line: String) throws {
@@ -136,6 +179,10 @@ public final class HardwareTransport {
       }
       if result < 0 {
         if errno == EINTR { continue }
+        if errno == EAGAIN || errno == EWOULDBLOCK {
+          usleep(1_000)
+          continue
+        }
         throw BridgeError("Could not write to \(port): \(String(cString: strerror(errno)))")
       }
       written += result
@@ -143,7 +190,7 @@ public final class HardwareTransport {
   }
 }
 
-private func configureSerial(_ descriptor: Int32, port: String) throws {
+func configureSerial(_ descriptor: Int32, port: String) throws {
   var options = termios()
   guard tcgetattr(descriptor, &options) == 0 else {
     throw BridgeError("Could not configure \(port): \(String(cString: strerror(errno)))")

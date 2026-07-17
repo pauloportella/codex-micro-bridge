@@ -10,6 +10,7 @@ let package = Package(
     .executable(name: "codex-micro-hardware", targets: ["CodexMicroHardware"]),
     .executable(name: "codex-midi", targets: ["CodexMidi"]),
     .executable(name: "codex-ride", targets: ["CodexRide"]),
+    .executable(name: "codex-micro-menu", targets: ["CodexMicroMenu"]),
   ],
   targets: [
     .target(name: "CodexMicroBridge"),
@@ -26,6 +27,18 @@ let package = Package(
       name: "CodexRide",
       dependencies: ["CodexMicroBridge"],
       linkerSettings: [.linkedFramework("CoreBluetooth")]
+    ),
+    .executableTarget(
+      name: "CodexMicroMenu",
+      dependencies: ["CodexMicroBridge"],
+      linkerSettings: [
+        .linkedFramework("AppKit"),
+        .linkedFramework("AudioToolbox"),
+        .linkedFramework("AVFoundation"),
+        .linkedFramework("CoreAudio"),
+        .linkedFramework("Security"),
+        .linkedFramework("SwiftUI"),
+      ]
     ),
     .testTarget(
       name: "CodexMicroBridgeTests",

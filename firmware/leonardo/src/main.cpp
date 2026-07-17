@@ -66,6 +66,7 @@ class CodexMicroHid final : public PluggableUSBModule {
 
   void poll();
   bool sendRpc(const char* json);
+  void replayFeedback();
 
  protected:
   int getInterface(uint8_t* interfaceCount) override;
@@ -76,6 +77,7 @@ class CodexMicroHid final : public PluggableUSBModule {
  private:
   void receiveReport(const uint8_t* bytes, uint8_t length);
   void consumeRpcBytes(const uint8_t* bytes, uint8_t length);
+  void appendRpcByte(char byte);
   void appendScanByte(char byte);
   void extractFields();
   void completeRpc();
@@ -94,6 +96,13 @@ class CodexMicroHid final : public PluggableUSBModule {
   char method_[24]{};
   long requestId_ = 0;
   bool hasRequestId_ = false;
+  char currentRpc_[512]{};
+  uint16_t currentRpcLength_ = 0;
+  bool currentRpcTruncated_ = false;
+  char cachedThreadRpc_[512]{};
+  uint16_t cachedThreadRpcLength_ = 0;
+  char cachedLightingRpc_[256]{};
+  uint16_t cachedLightingRpcLength_ = 0;
 };
 
 CodexMicroHid codexHid;
@@ -195,10 +204,18 @@ void CodexMicroHid::consumeRpcBytes(const uint8_t* bytes, uint8_t length) {
 
     if (!rpcStarted_) {
       if (byte != '{') continue;
+      currentRpcLength_ = 0;
+      currentRpcTruncated_ = false;
+      appendRpcByte(byte);
+      Serial.print(F("FEEDBACK "));
+      Serial.write(byte);
       rpcStarted_ = true;
       rpcDepth_ = 1;
       continue;
     }
+
+    appendRpcByte(byte);
+    Serial.write(byte);
 
     if (rpcInString_) {
       if (rpcEscape_) {
@@ -217,8 +234,20 @@ void CodexMicroHid::consumeRpcBytes(const uint8_t* bytes, uint8_t length) {
       ++rpcDepth_;
     } else if (byte == '}' || byte == ']') {
       --rpcDepth_;
-      if (rpcDepth_ == 0) completeRpc();
+      if (rpcDepth_ == 0) {
+        Serial.println();
+        completeRpc();
+      }
     }
+  }
+}
+
+void CodexMicroHid::appendRpcByte(char byte) {
+  if (currentRpcLength_ < sizeof(currentRpc_) - 1) {
+    currentRpc_[currentRpcLength_++] = byte;
+    currentRpc_[currentRpcLength_] = '\0';
+  } else {
+    currentRpcTruncated_ = true;
   }
 }
 
@@ -269,6 +298,16 @@ void CodexMicroHid::extractFields() {
 void CodexMicroHid::completeRpc() {
   digitalWrite(LED_BUILTIN, HIGH);
 
+  if (strcmp(method_, "v.oai.thstatus") == 0 && !currentRpcTruncated_) {
+    memcpy(cachedThreadRpc_, currentRpc_, currentRpcLength_ + 1);
+    cachedThreadRpcLength_ = currentRpcLength_;
+  } else if (strcmp(method_, "v.oai.rgbcfg") == 0 &&
+             !currentRpcTruncated_ &&
+             currentRpcLength_ < sizeof(cachedLightingRpc_)) {
+    memcpy(cachedLightingRpc_, currentRpc_, currentRpcLength_ + 1);
+    cachedLightingRpcLength_ = currentRpcLength_;
+  }
+
   char response[192]{};
   if (!hasRequestId_ || !method_[0]) {
     resetRpc();
@@ -278,7 +317,7 @@ void CodexMicroHid::completeRpc() {
   if (strcmp(method_, "device.status") == 0) {
     snprintf_P(
         response, sizeof(response),
-        PSTR("{\"id\":%ld,\"result\":{\"version\":\"0.2.0-hw\","
+        PSTR("{\"id\":%ld,\"result\":{\"version\":\"0.4.0-hw\","
              "\"profile_index\":0,\"layer_index\":0,\"battery\":100,"
              "\"is_charging\":true}}\n"),
         requestId_);
@@ -297,6 +336,27 @@ void CodexMicroHid::completeRpc() {
   digitalWrite(LED_BUILTIN, LOW);
 }
 
+void CodexMicroHid::replayFeedback() {
+  if (!cachedThreadRpcLength_ && !cachedLightingRpcLength_) {
+    Serial.println(F("STATE EMPTY"));
+    return;
+  }
+  if (cachedThreadRpcLength_) {
+    Serial.print(F("FEEDBACK "));
+    Serial.write(
+        reinterpret_cast<const uint8_t*>(cachedThreadRpc_),
+        cachedThreadRpcLength_);
+    Serial.println();
+  }
+  if (cachedLightingRpcLength_) {
+    Serial.print(F("FEEDBACK "));
+    Serial.write(
+        reinterpret_cast<const uint8_t*>(cachedLightingRpc_),
+        cachedLightingRpcLength_);
+    Serial.println();
+  }
+}
+
 void CodexMicroHid::resetRpc() {
   rpcStarted_ = false;
   rpcInString_ = false;
@@ -307,6 +367,9 @@ void CodexMicroHid::resetRpc() {
   method_[0] = '\0';
   requestId_ = 0;
   hasRequestId_ = false;
+  currentRpcLength_ = 0;
+  currentRpc_[0] = '\0';
+  currentRpcTruncated_ = false;
 }
 
 bool CodexMicroHid::sendRpc(const char* json) {
@@ -382,7 +445,9 @@ void processSerialLine(char* line) {
   }
 
   if (strcmp(command, "PING") == 0) {
-    Serial.println(F("READY Codex Micro Bridge 0.2.0-hw"));
+    Serial.println(F("READY Codex Micro Bridge 0.4.0-hw"));
+  } else if (strcmp(command, "REPLAY") == 0) {
+    codexHid.replayFeedback();
   }
 }
 
