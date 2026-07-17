@@ -1,0 +1,143 @@
+#!/usr/bin/env node
+
+const { spawn, spawnSync } = require("node:child_process");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const readline = require("node:readline");
+
+const { MidiMapper, validateMidiConfig } = require("../lib/midi.cjs");
+const { HardwareTransport } = require("../lib/hardware.cjs");
+
+const projectRoot = path.resolve(__dirname, "..");
+const sourcePath = path.join(projectRoot, "midi", "midi-source.swift");
+
+main().catch((error) => {
+  console.error(error.message);
+  process.exitCode = 1;
+});
+
+async function main() {
+  const [command = "help", argument] = process.argv.slice(2);
+  if (command === "validate") {
+    const configPath = resolveConfig(argument);
+    validateMidiConfig(readJson(configPath));
+    console.log(`Valid MIDI mapping: ${configPath}`);
+    return;
+  }
+
+  const nativeBinary = buildNativeSource();
+  if (command === "list") {
+    const result = spawnSync(nativeBinary, ["--list"], { encoding: "utf8" });
+    if (result.status !== 0) throw new Error(result.stderr.trim() || "Could not list MIDI inputs");
+    const sources = JSON.parse(result.stdout);
+    if (sources.length === 0) {
+      console.log("No MIDI inputs found.");
+      return;
+    }
+    for (const source of sources) {
+      console.log(`${source.name} (id ${source.id})`);
+      const details = [source.manufacturer, source.model].filter(Boolean).join(" / ");
+      if (details) console.log(`  ${details}`);
+    }
+    return;
+  }
+
+  if (command === "monitor") {
+    await streamMidi(nativeBinary, argument ?? "", (event) => {
+      console.log(JSON.stringify(event));
+    });
+    return;
+  }
+
+  if (command === "run") {
+    const configPath = resolveConfig(argument);
+    const config = validateMidiConfig(readJson(configPath));
+    const hardware = new HardwareTransport({ port: config.serialPort }).open();
+    console.error(`Using physical bridge: ${hardware.port}`);
+
+    const mapper = new MidiMapper(config);
+    let commandQueue = Promise.resolve();
+    console.error(`Using MIDI mapping: ${configPath}`);
+    try {
+      await streamMidi(nativeBinary, config.deviceContains, (event) => {
+        const commands = mapper.process(event);
+        for (const bridgeCommand of commands) {
+          commandQueue = commandQueue
+            .then(() => hardware.send(bridgeCommand))
+            .then(() => console.error(`${event.source}: ${event.message} ${event.number} -> ${bridgeCommand.key}`))
+            .catch((error) => console.error(`MIDI command failed: ${error.message}`));
+        }
+      });
+      await commandQueue;
+    } finally {
+      hardware.close();
+    }
+    return;
+  }
+
+  console.log("Usage: codex-midi list | monitor [device-name] | validate [config.json] | run [config.json]");
+}
+
+function resolveConfig(value) {
+  return path.resolve(value || path.join(projectRoot, "config", "midi.example.json"));
+}
+
+function readJson(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (error) {
+    throw new Error(`Cannot read MIDI config ${filePath}: ${error.message}`);
+  }
+}
+
+function buildNativeSource() {
+  const source = fs.readFileSync(sourcePath);
+  const digest = crypto.createHash("sha256").update(source).digest("hex").slice(0, 12);
+  const buildDirectory = path.join(os.tmpdir(), `codex-micro-midi-${process.getuid?.() ?? "user"}`);
+  const binary = path.join(buildDirectory, `midi-source-${digest}`);
+  if (fs.existsSync(binary)) return binary;
+
+  fs.mkdirSync(buildDirectory, { recursive: true, mode: 0o700 });
+  const temporaryBinary = `${binary}.${process.pid}`;
+  const result = spawnSync("xcrun", [
+    "swiftc",
+    sourcePath,
+    "-o",
+    temporaryBinary,
+    "-framework",
+    "CoreMIDI",
+    "-framework",
+    "Foundation",
+  ], { encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`Could not build the CoreMIDI reader:\n${result.stderr.trim()}`);
+  }
+  fs.renameSync(temporaryBinary, binary);
+  fs.chmodSync(binary, 0o700);
+  return binary;
+}
+
+function streamMidi(nativeBinary, deviceContains, onEvent) {
+  return new Promise((resolve, reject) => {
+    const args = deviceContains ? ["--device", deviceContains] : [];
+    const child = spawn(nativeBinary, args, { stdio: ["ignore", "pipe", "inherit"] });
+    const lines = readline.createInterface({ input: child.stdout });
+    lines.on("line", (line) => {
+      try {
+        onEvent(JSON.parse(line));
+      } catch (error) {
+        console.error(`Ignored invalid MIDI event: ${error.message}`);
+      }
+    });
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      if (signal || code === 0) resolve();
+      else reject(new Error(`CoreMIDI reader exited with code ${code}`));
+    });
+    for (const signal of ["SIGINT", "SIGTERM"]) {
+      process.once(signal, () => child.kill(signal));
+    }
+  });
+}

@@ -1,0 +1,13 @@
+{
+  "name": "codex-micro-bridge",
+  "version": "0.4.0",
+  "private": true,
+  "description": "Development bridge that presents MIDI and other controllers as a Codex Micro input source.",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test test/*.test.cjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "mappings": [
+    { "button": "navigationUp", "action": { "type": "key", "key": "AG00" } },
+    { "button": "navigationDown", "action": { "type": "key", "key": "AG01" } },
+    { "button": "navigationLeft", "action": { "type": "key", "key": "AG02" } },
+    { "button": "navigationRight", "action": { "type": "key", "key": "AG03" } },
+    { "button": "a", "action": { "type": "key", "key": "AG04" } },
+    { "button": "b", "action": { "type": "key", "key": "AG05" } },
+    { "button": "y", "action": { "type": "key", "key": "ACT06" } },
+    { "button": "z", "action": { "type": "key", "key": "ACT07" } },
+    { "button": "shiftUpLeft", "action": { "type": "key", "key": "ACT08" } },
+    { "button": "shiftDownLeft", "action": { "type": "key", "key": "ACT09" } },
+    { "button": "shiftUpRight", "action": { "type": "key", "key": "ACT10" } },
+    { "button": "shiftDownRight", "action": { "type": "key", "key": "ACT12" } },
+    { "button": "powerUpLeft", "action": { "type": "turn", "direction": "ccw" } },
+    { "button": "powerUpRight", "action": { "type": "turn", "direction": "cw" } },
+    { "button": "onOffLeft", "action": { "type": "key", "key": "ENC" } },
+    { "button": "onOffRight", "action": { "type": "key", "key": "MIC" } },
+    { "button": "paddleLeft", "action": { "type": "turn", "direction": "ccw" } },
+    { "button": "paddleRight", "action": { "type": "turn", "direction": "cw" } }
+  ]
+}

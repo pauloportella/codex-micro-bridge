@@ -1,0 +1,95 @@
+#!/usr/bin/env node
+
+const {
+  HardwareTransport,
+  listHardwarePorts,
+} = require("../lib/hardware.cjs");
+
+main().catch((error) => {
+  console.error(error.message);
+  process.exitCode = 1;
+});
+
+async function main() {
+  const args = process.argv.slice(2);
+  const portIndex = args.indexOf("--port");
+  let port;
+  if (portIndex >= 0) {
+    port = args[portIndex + 1];
+    if (!port) fail("--port requires a device path");
+    args.splice(portIndex, 2);
+  }
+
+  const [subcommand, ...rest] = args;
+  if (subcommand === "list") {
+    const ports = listHardwarePorts();
+    console.log(ports.length ? ports.join("\n") : "No physical Codex Micro Bridge found.");
+    return;
+  }
+
+  const command = parseCommand(subcommand, rest);
+  const transport = new HardwareTransport({ port }).open();
+  try {
+    await transport.send(command);
+    console.log(`${transport.port}: sent ${subcommand}`);
+  } finally {
+    transport.close();
+  }
+}
+
+function parseCommand(subcommand, rest) {
+  switch (subcommand) {
+    case "press":
+      requireValue(rest[0], "press requires a key, for example ACT06");
+      return { type: "press", key: rest[0], durationMs: numberOr(rest[1], 60) };
+    case "down":
+      requireValue(rest[0], "down requires a key");
+      return { type: "hid", key: rest[0], act: 1 };
+    case "up":
+      requireValue(rest[0], "up requires a key");
+      return { type: "hid", key: rest[0], act: 0 };
+    case "agent": {
+      const slot = Number(rest[0]);
+      if (!Number.isInteger(slot) || slot < 0 || slot > 5) fail("agent requires a slot from 0 through 5");
+      return { type: "press", key: `AG0${slot}`, durationMs: 60 };
+    }
+    case "command": {
+      const slot = Number(rest[0]);
+      if (!Number.isInteger(slot) || slot < 6 || slot > 12 || slot === 11) {
+        fail("command requires 6, 7, 8, 9, 10, or 12");
+      }
+      return { type: "press", key: `ACT${String(slot).padStart(2, "0")}`, durationMs: 60 };
+    }
+    case "turn": {
+      const direction = rest[0]?.toLowerCase();
+      if (!["cw", "ccw"].includes(direction)) fail("turn requires cw or ccw");
+      return { type: "hid", key: direction === "cw" ? "ENC_CW" : "ENC_CC", act: 2 };
+    }
+    case "joystick": {
+      const angle = Number(rest[0]);
+      const distance = Number(rest[1]);
+      if (!Number.isFinite(angle) || !Number.isFinite(distance)) {
+        fail("joystick requires numeric angle and distance");
+      }
+      return { type: "joystick", angle, distance };
+    }
+    default:
+      fail("Usage: codex-micro-hardware [--port PATH] list | press KEY [ms] | down KEY | up KEY | agent 0-5 | command 6-10,12 | turn cw|ccw | joystick ANGLE DISTANCE");
+  }
+}
+
+function numberOr(value, fallback) {
+  if (value == null) return fallback;
+  const number = Number(value);
+  if (!Number.isFinite(number)) fail(`Invalid number: ${value}`);
+  return number;
+}
+
+function requireValue(value, message) {
+  if (!value) fail(message);
+}
+
+function fail(message) {
+  console.error(message);
+  process.exit(2);
+}

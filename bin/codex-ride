@@ -1,0 +1,133 @@
+#!/usr/bin/env node
+
+const { spawn, spawnSync } = require("node:child_process");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const readline = require("node:readline");
+
+const { HardwareTransport } = require("../lib/hardware.cjs");
+const { RideMapper, validateRideConfig } = require("../lib/ride.cjs");
+
+const projectRoot = path.resolve(__dirname, "..");
+const sourcePath = path.join(projectRoot, "ride", "zwift-ride-source.swift");
+
+main().catch((error) => {
+  console.error(error.message);
+  process.exitCode = 1;
+});
+
+async function main() {
+  const [command = "help", argument] = process.argv.slice(2);
+  const configPath = resolveConfig(argument);
+
+  if (command === "validate") {
+    validateRideConfig(readJson(configPath));
+    console.log(`Valid Zwift Ride mapping: ${configPath}`);
+    return;
+  }
+
+  const nativeBinary = buildNativeSource();
+  if (command === "self-test") {
+    const result = spawnSync(nativeBinary, ["--self-test"], { encoding: "utf8" });
+    if (result.status !== 0) throw new Error(result.stderr.trim() || "Zwift Ride decoder self-test failed");
+    process.stdout.write(result.stdout);
+    return;
+  }
+
+  if (command === "monitor") {
+    await streamRide(nativeBinary, (event) => console.log(JSON.stringify(event)));
+    return;
+  }
+
+  if (command === "run") {
+    const config = validateRideConfig(readJson(configPath));
+    const mapper = new RideMapper(config);
+    const hardware = new HardwareTransport({ port: config.serialPort }).open();
+    let commandQueue = Promise.resolve();
+    console.error(`Using physical bridge: ${hardware.port}`);
+    console.error(`Using Zwift Ride mapping: ${configPath}`);
+    try {
+      await streamRide(nativeBinary, (event) => {
+        if (event.message === "status" || event.message === "error") {
+          console.error(`[Zwift Ride] ${event.state || event.error}`);
+          return;
+        }
+        for (const command of mapper.process(event)) {
+          commandQueue = commandQueue
+            .then(() => hardware.send(command))
+            .then(() => console.error(`${event.button} ${event.state} -> ${command.key}`))
+            .catch((error) => console.error(`Zwift Ride command failed: ${error.message}`));
+        }
+      });
+      await commandQueue;
+    } finally {
+      hardware.close();
+    }
+    return;
+  }
+
+  console.log("Usage: codex-ride monitor | validate [config.json] | self-test | run [config.json]");
+}
+
+function resolveConfig(value) {
+  return path.resolve(value || path.join(projectRoot, "config", "zwift-ride.example.json"));
+}
+
+function readJson(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (error) {
+    throw new Error(`Cannot read Zwift Ride config ${filePath}: ${error.message}`);
+  }
+}
+
+function buildNativeSource() {
+  const source = fs.readFileSync(sourcePath);
+  const digest = crypto.createHash("sha256").update(source).digest("hex").slice(0, 12);
+  const buildDirectory = path.join(os.tmpdir(), `codex-ride-${process.getuid?.() ?? "user"}`);
+  const binary = path.join(buildDirectory, `zwift-ride-source-${digest}`);
+  if (fs.existsSync(binary)) return binary;
+
+  fs.mkdirSync(buildDirectory, { recursive: true, mode: 0o700 });
+  const temporaryBinary = `${binary}.${process.pid}`;
+  const result = spawnSync("xcrun", [
+    "swiftc",
+    sourcePath,
+    "-o",
+    temporaryBinary,
+    "-framework",
+    "CoreBluetooth",
+    "-framework",
+    "Foundation",
+  ], { encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`Could not build the Zwift Ride reader:\n${result.stderr.trim()}`);
+  }
+  fs.renameSync(temporaryBinary, binary);
+  fs.chmodSync(binary, 0o700);
+  return binary;
+}
+
+function streamRide(nativeBinary, onEvent) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(nativeBinary, [], { stdio: ["ignore", "pipe", "inherit"] });
+    const lines = readline.createInterface({ input: child.stdout });
+    lines.on("line", (line) => {
+      try {
+        onEvent(JSON.parse(line));
+      } catch (error) {
+        console.error(`Ignored invalid Zwift Ride event: ${error.message}`);
+      }
+    });
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      if (signal || code === 0) resolve();
+      else reject(new Error(`Zwift Ride reader exited with code ${code}`));
+    });
+    for (const signal of ["SIGINT", "SIGTERM"]) {
+      process.once(signal, () => child.kill(signal));
+    }
+  });
+}
