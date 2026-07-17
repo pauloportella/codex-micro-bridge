@@ -147,6 +147,22 @@ final class CompanionTests: XCTestCase {
     XCTAssertEqual(tracker.state, .idle)
   }
 
+  func testNewTurnSupersedesOrphanedTurnInSameSession() {
+    var tracker = CodexActivityTracker()
+    tracker.consume(
+      #"{"type":"event_msg","payload":{"type":"task_started","turn_id":"orphaned-turn"}}"#
+    )
+    tracker.consume(
+      #"{"type":"event_msg","payload":{"type":"task_started","turn_id":"current-turn"}}"#
+    )
+    tracker.consume(
+      #"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"current-turn"}}"#
+    )
+
+    XCTAssertEqual(tracker.state, .idle)
+    XCTAssertTrue(tracker.activeTurnIDs.isEmpty)
+  }
+
   func testSpeechTrackerEmitsOnlyLastAssistantResponseAtCompletion() {
     var tracker = CodexSpeechTurnTracker()
     XCTAssertEqual(

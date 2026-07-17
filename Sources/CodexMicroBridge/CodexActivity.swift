@@ -30,7 +30,9 @@ public struct CodexActivityTracker {
     {
       switch eventType {
       case "task_started":
+        activeTurnIDs.removeAll()
         activeTurnIDs.insert(turnID)
+        pendingResponseCallIDs.removeAll()
       case "task_complete", "turn_aborted":
         activeTurnIDs.remove(turnID)
         pendingResponseCallIDs.removeAll()
