@@ -1,0 +1,4 @@
+.DS_Store
+.build/
+firmware/leonardo/.pio/
+config/my-controller.json
