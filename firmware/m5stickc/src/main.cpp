@@ -1,8 +1,15 @@
 #include <Arduino.h>
 #include <BLE2902.h>
 #include <BLEDevice.h>
+#include <BLESecurity.h>
 #include <BLEServer.h>
 #include <M5Unified.h>
+
+#include "codex_hid_bridge.h"
+#include "codex_rpc_protocol.h"
+#include "firmware_version.h"
+#include "ride_bridge.h"
+#include "voice_button_controller.h"
 
 namespace {
 
@@ -12,6 +19,9 @@ constexpr char kWriteUuid[] = "7A0A0003-1E8E-4D91-9A4B-21D02E0C0D01";
 constexpr uint8_t kAgentCount = 6;
 constexpr uint32_t kMicSampleRate = 16000;
 constexpr size_t kMicSamples = 160;
+constexpr uint32_t kDoneDisplayMs = 2000;
+constexpr uint32_t kVoiceProcessingTimeoutMs = 60000;
+constexpr size_t kRpcMessageBytes = 1024;
 
 enum class AgentState : uint8_t {
   Off,
@@ -36,9 +46,16 @@ enum class SpeechState : uint8_t {
 };
 
 struct CommandMessage {
-  char text[24];
+  char text[48];
 };
 
+struct RpcMessage {
+  char text[kRpcMessageBytes];
+};
+
+CodexHidBridge codexHid;
+RideBridge rideBridge;
+VoiceButtonController voiceButton;
 AgentState agents[kAgentCount]{};
 VoiceState voiceState = VoiceState::Idle;
 SpeechState speechState = SpeechState::Idle;
@@ -49,13 +66,43 @@ uint8_t micRecordIndex = 2;
 int micLevel = 0;
 int lastSentMicLevel = -1;
 uint32_t lastMicReportMs = 0;
+uint32_t doneUntilMs = 0;
+uint8_t unreadMask = 0;
 char displayedLabel[12] = "OFFLINE";
 BLECharacteristic* notifyCharacteristic = nullptr;
+BLE2902* companionNotifyDescriptor = nullptr;
 QueueHandle_t commandQueue = nullptr;
+QueueHandle_t rpcQueue = nullptr;
 volatile bool bleConnected = false;
 volatile bool announceReady = false;
 volatile bool hasCodexState = false;
 volatile bool screenDirty = true;
+volatile bool voiceSubmitPending = false;
+volatile uint32_t voiceCompletedAtMs = 0;
+uint32_t voiceStateChangedAtMs = 0;
+bool voiceFeedbackObserved = false;
+volatile uint32_t droppedRpcMessages = 0;
+
+bool companionModeActive() {
+  return companionNotifyDescriptor != nullptr &&
+         companionNotifyDescriptor->getNotifications();
+}
+
+void resetVoiceState() {
+  voiceState = VoiceState::Idle;
+  voiceButton.observedIdle();
+  voiceSubmitPending = false;
+  voiceFeedbackObserved = false;
+  voiceStateChangedAtMs = millis();
+  screenDirty = true;
+}
+
+void setVoiceState(VoiceState state, bool feedbackObserved) {
+  voiceState = state;
+  voiceFeedbackObserved = feedbackObserved;
+  voiceStateChangedAtMs = millis();
+  screenDirty = true;
+}
 
 uint16_t rgb(uint32_t color) {
   return M5.Display.color565(
@@ -165,6 +212,163 @@ AgentState parseState(const char* value) {
   return AgentState::Off;
 }
 
+bool extractJsonLong(const char* start, const char* end, const char* field,
+                     long* value) {
+  const char* found = strstr(start, field);
+  if (found == nullptr || found >= end) return false;
+  const char* colon = strchr(found + strlen(field), ':');
+  if (colon == nullptr || colon >= end) return false;
+  *value = strtol(colon + 1, nullptr, 10);
+  return true;
+}
+
+bool extractJsonDouble(const char* start, const char* end, const char* field,
+                       double* value) {
+  const char* found = strstr(start, field);
+  if (found == nullptr || found >= end) return false;
+  const char* colon = strchr(found + strlen(field), ':');
+  if (colon == nullptr || colon >= end) return false;
+  *value = strtod(colon + 1, nullptr);
+  return true;
+}
+
+AgentState stateForColor(long color, double brightness) {
+  if (brightness <= 0 || color == 0) return AgentState::Off;
+  switch (color) {
+    case 0x304FFE:
+      return AgentState::Thinking;
+    case 0x00FF4C:
+      return AgentState::Unread;
+    case 0xFFFFFF:
+      return AgentState::Idle;
+    case 0xFF6D00:
+      return AgentState::NeedsInput;
+    case 0xFF0033:
+      return AgentState::Error;
+    default:
+      return AgentState::Off;
+  }
+}
+
+void processThreadStatus(const char* json) {
+  const char* params = strstr(json, "\"params\"");
+  const char* cursor = params == nullptr ? nullptr : strchr(params, '[');
+  if (cursor == nullptr) return;
+  const char* paramsEnd = strchr(cursor, ']');
+  if (paramsEnd == nullptr) return;
+  ++cursor;
+  AgentState nextAgents[kAgentCount]{};
+  bool decodedAny = false;
+  while ((cursor = strchr(cursor, '{')) != nullptr && cursor < paramsEnd) {
+    const char* end = strchr(cursor, '}');
+    if (end == nullptr || end > paramsEnd) return;
+    long id = -1;
+    long color = 0;
+    double brightness = 1;
+    if (extractJsonLong(cursor, end, "\"id\"", &id) &&
+        extractJsonLong(cursor, end, "\"c\"", &color) && id >= 0 &&
+        id < kAgentCount) {
+      extractJsonDouble(cursor, end, "\"b\"", &brightness);
+      nextAgents[id] = stateForColor(color, brightness);
+      decodedAny = true;
+    }
+    cursor = end + 1;
+  }
+  if (decodedAny) {
+    memcpy(agents, nextAgents, sizeof(agents));
+    uint8_t currentUnreadMask = 0;
+    for (uint8_t index = 0; index < kAgentCount; ++index) {
+      if (agents[index] == AgentState::Unread) {
+        currentUnreadMask |= static_cast<uint8_t>(1U << index);
+      }
+    }
+    if ((currentUnreadMask & ~unreadMask) != 0) {
+      doneUntilMs = millis() + kDoneDisplayMs;
+    }
+    unreadMask = currentUnreadMask;
+    hasCodexState = true;
+    screenDirty = true;
+  }
+}
+
+void processLightingStatus(const char* json) {
+  const char* ambient = strstr(json, "\"ambient\"");
+  const char* start = ambient == nullptr ? nullptr : strchr(ambient, '{');
+  const char* end = start == nullptr ? nullptr : strchr(start, '}');
+  if (start == nullptr || end == nullptr) return;
+  long effect = 0;
+  long color = 0;
+  double brightness = 1;
+  if (!extractJsonLong(start, end, "\"e\"", &effect) ||
+      !extractJsonLong(start, end, "\"c\"", &color)) {
+    return;
+  }
+  extractJsonDouble(start, end, "\"b\"", &brightness);
+
+  if (brightness > 0 && effect == 2 && color == 0x2E8B57) {
+    if (voiceButton.observedRecording()) {
+      setVoiceState(VoiceState::Recording, true);
+    }
+  } else if (brightness > 0 && effect == 2 && color == 0xFFFFFF) {
+    voiceButton.observedProcessing();
+    setVoiceState(VoiceState::Processing, true);
+  } else if (brightness > 0 && effect == 1 && color == 0xFFFFFF &&
+             (voiceState == VoiceState::Recording ||
+              voiceState == VoiceState::Processing)) {
+    voiceButton.observedCompleted();
+    setVoiceState(VoiceState::Completed, true);
+    voiceSubmitPending = true;
+    voiceCompletedAtMs = millis();
+  } else if (voiceFeedbackObserved &&
+             (voiceState == VoiceState::Recording ||
+              voiceState == VoiceState::Processing)) {
+    Serial.println(F("CODEX VOICE RETURNED TO IDLE"));
+    resetVoiceState();
+  }
+}
+
+void processCodexRpc(const char* json) {
+  if (companionModeActive()) return;
+  char method[24]{};
+  if (!extractTopLevelMethod(json, method, sizeof(method))) return;
+  if (strcmp(method, "v.oai.thstatus") == 0) {
+    processThreadStatus(json);
+  } else if (strcmp(method, "v.oai.rgbcfg") == 0) {
+    processLightingStatus(json);
+  } else if (strcmp(method, "v.m5.ride") == 0) {
+    if (strstr(json, "\"command\":\"status\"") != nullptr) {
+      rideBridge.reportStatus();
+    } else if (strstr(json, "\"command\":\"mute\"") != nullptr) {
+      rideBridge.setHidMuted(true);
+    } else if (strstr(json, "\"command\":\"unmute\"") != nullptr) {
+      rideBridge.setHidMuted(false);
+    } else if (strstr(json, "\"command\":\"stop\"") != nullptr) {
+      rideBridge.stopScan();
+    } else if (strstr(json, "\"command\":\"scan\"") != nullptr) {
+      long seconds = 60;
+      extractJsonLong(json, json + strlen(json), "\"seconds\"", &seconds);
+      seconds = constrain(seconds, 1L, 300L);
+      rideBridge.scanFor(static_cast<uint32_t>(seconds) * 1000);
+    }
+  }
+}
+
+void enqueueCodexRpc(const char* json) {
+  if (json == nullptr || rpcQueue == nullptr) return;
+  RpcMessage message{};
+  const size_t length = strnlen(json, sizeof(message.text));
+  if (length >= sizeof(message.text)) {
+    ++droppedRpcMessages;
+    return;
+  }
+  memcpy(message.text, json, length + 1);
+  if (xQueueSend(rpcQueue, &message, 0) == pdTRUE) return;
+
+  RpcMessage discarded{};
+  xQueueReceive(rpcQueue, &discarded, 0);
+  if (xQueueSend(rpcQueue, &message, 0) != pdTRUE) ++droppedRpcMessages;
+}
+
 void drawMicMeter() {
   constexpr int x = 185;
   constexpr int y = 120;
@@ -191,13 +395,21 @@ void drawDashboard() {
   } else if (bleConnected && !hasCodexState) {
     label = "WAITING";
   } else if (bleConnected) {
+    const bool showDone =
+        doneUntilMs != 0 && static_cast<int32_t>(doneUntilMs - millis()) > 0;
     for (uint8_t index = 0; index < kAgentCount; ++index) {
-      const int priority = statePriority(agents[index]);
+      const AgentState agentState = agents[index];
+      const int priority =
+          agentState == AgentState::Unread && !showDone ? 0
+                                                       : statePriority(agentState);
       if (priority > selectedPriority) {
         selectedPriority = priority;
         selectedAgent = index;
       }
-      if (isActive(agents[index])) ++activeCount;
+      if (isActive(agentState) &&
+          (agentState != AgentState::Unread || showDone)) {
+        ++activeCount;
+      }
     }
     if (selectedPriority == 0) {
       selectedAgent = -1;
@@ -265,7 +477,40 @@ void emitLine(const char* line) {
 
 void processCommand(char* line) {
   if (strcmp(line, "PING") == 0) {
-    emitLine("READY M5 0.3");
+    if (companionModeActive()) resetVoiceState();
+    char ready[32]{};
+    snprintf(ready, sizeof(ready), "READY M5 %s", kCodexM5FirmwareVersion);
+    emitLine(ready);
+    return;
+  }
+
+  if (strncmp(line, "HID ", 4) == 0) {
+    char* key = strtok(line + 4, " ");
+    char* actionText = strtok(nullptr, " ");
+    char* agentText = strtok(nullptr, " ");
+    if (key != nullptr && actionText != nullptr) {
+      codexHid.sendKey(key, atoi(actionText),
+                       agentText == nullptr ? -1 : atoi(agentText));
+    }
+    return;
+  }
+
+  if (strncmp(line, "RIDE", 4) == 0) {
+    if (strcmp(line, "RIDE STATUS") == 0) {
+      rideBridge.reportStatus();
+    } else if (strcmp(line, "RIDE MUTE") == 0) {
+      rideBridge.setHidMuted(true);
+    } else if (strcmp(line, "RIDE UNMUTE") == 0) {
+      rideBridge.setHidMuted(false);
+    } else if (strcmp(line, "RIDE STOP") == 0) {
+      rideBridge.stopScan();
+    } else if (strncmp(line, "RIDE SCAN", 9) == 0) {
+      const char* secondsText = line + 9;
+      while (*secondsText == ' ') ++secondsText;
+      long seconds = *secondsText == '\0' ? 60 : strtol(secondsText, nullptr, 10);
+      seconds = constrain(seconds, 1L, 300L);
+      rideBridge.scanFor(static_cast<uint32_t>(seconds) * 1000);
+    }
     return;
   }
 
@@ -287,7 +532,12 @@ void processCommand(char* line) {
   }
 
   if (strncmp(line, "VOICE ", 6) == 0) {
-    voiceState = parseVoiceState(line + 6);
+    const VoiceState next = parseVoiceState(line + 6);
+    if (next == VoiceState::Idle) {
+      resetVoiceState();
+    } else {
+      setVoiceState(next, true);
+    }
     drawDashboard();
     char acknowledgement[24]{};
     snprintf(
@@ -313,7 +563,6 @@ void processCommand(char* line) {
     emitLine(acknowledgement);
     return;
   }
-
 }
 
 void pollSerial() {
@@ -342,12 +591,57 @@ void pollBleCommands() {
   }
 }
 
+void pollCodexRpc() {
+  if (rpcQueue == nullptr) return;
+  RpcMessage message{};
+  while (xQueueReceive(rpcQueue, &message, 0) == pdTRUE) {
+    processCodexRpc(message.text);
+  }
+  if (droppedRpcMessages != 0) {
+    const uint32_t dropped = droppedRpcMessages;
+    droppedRpcMessages = 0;
+    Serial.printf("CODEX RPC QUEUE DROPPED %lu MESSAGE(S)\n",
+                  static_cast<unsigned long>(dropped));
+  }
+}
+
 void emitButtons() {
-  if (M5.BtnA.wasPressed()) emitLine("BUTTON A DOWN");
+  if (M5.BtnA.wasPressed()) {
+    emitLine("BUTTON A DOWN");
+    if (!companionModeActive()) {
+      const auto action = voiceButton.nextAction();
+      if (action == VoiceButtonController::Action::Start) {
+        setVoiceState(VoiceState::Recording, false);
+        Serial.println(F("CODEX VOICE BUTTON START ACT10 X2"));
+        const bool firstPress = codexHid.press("ACT10");
+        delay(60);
+        const bool secondPress = codexHid.press("ACT10");
+        if (!firstPress || !secondPress) {
+          Serial.println(F("CODEX VOICE START FAILED"));
+          resetVoiceState();
+        }
+      } else if (action == VoiceButtonController::Action::Stop) {
+        setVoiceState(VoiceState::Processing, false);
+        Serial.println(F("CODEX VOICE BUTTON STOP ACT10 X1"));
+        if (!codexHid.press("ACT10")) {
+          Serial.println(F("CODEX VOICE STOP FAILED"));
+          resetVoiceState();
+        }
+      } else {
+        Serial.println(F("CODEX VOICE BUTTON IGNORED DURING TRANSCRIPTION"));
+      }
+    }
+  }
   if (M5.BtnA.wasReleased()) emitLine("BUTTON A UP");
-  if (M5.BtnB.wasPressed()) emitLine("BUTTON B DOWN");
+  if (M5.BtnB.wasPressed()) {
+    emitLine("BUTTON B DOWN");
+    if (!companionModeActive()) codexHid.press("ACT07");
+  }
   if (M5.BtnB.wasReleased()) emitLine("BUTTON B UP");
-  if (M5.BtnPWR.wasPressed()) emitLine("BUTTON POWER DOWN");
+  if (M5.BtnPWR.wasPressed()) {
+    emitLine("BUTTON POWER DOWN");
+    if (!companionModeActive()) codexHid.press("ACT08");
+  }
   if (M5.BtnPWR.wasReleased()) emitLine("BUTTON POWER UP");
 }
 
@@ -379,21 +673,50 @@ void pollMicrophone() {
 
 class ServerCallbacks : public BLEServerCallbacks {
  public:
-  void onConnect(BLEServer*) override {
+  void onConnect(BLEServer*, esp_ble_gatts_cb_param_t* parameters) override {
+    if (parameters != nullptr &&
+        rideBridge.isRidePeer(parameters->connect.remote_bda)) {
+      Serial.println(F("RIDE BLE PEER CONNECTED"));
+      return;
+    }
+    if (companionNotifyDescriptor != nullptr) {
+      companionNotifyDescriptor->setNotifications(false);
+    }
     bleConnected = true;
+    codexHid.setConnected(true);
     hasCodexState = false;
+    unreadMask = 0;
+    doneUntilMs = 0;
     voiceState = VoiceState::Idle;
+    voiceButton.reset();
+    voiceSubmitPending = false;
     speechState = SpeechState::Idle;
     screenDirty = true;
     announceReady = true;
+    Serial.println(F("CODEX BLE PEER CONNECTED"));
   }
 
-  void onDisconnect(BLEServer*) override {
+  void onDisconnect(BLEServer*, esp_ble_gatts_cb_param_t* parameters) override {
+    if (parameters != nullptr &&
+        rideBridge.isRidePeer(parameters->disconnect.remote_bda)) {
+      Serial.println(F("RIDE BLE PEER DISCONNECTED"));
+      BLEDevice::startAdvertising();
+      return;
+    }
+    if (companionNotifyDescriptor != nullptr) {
+      companionNotifyDescriptor->setNotifications(false);
+    }
     bleConnected = false;
+    codexHid.setConnected(false);
     hasCodexState = false;
+    unreadMask = 0;
+    doneUntilMs = 0;
     voiceState = VoiceState::Idle;
+    voiceButton.reset();
+    voiceSubmitPending = false;
     speechState = SpeechState::Idle;
     screenDirty = true;
+    Serial.println(F("CODEX BLE PEER DISCONNECTED"));
     BLEDevice::startAdvertising();
   }
 };
@@ -412,27 +735,38 @@ class CommandCallbacks : public BLECharacteristicCallbacks {
 
 void startBluetooth() {
   commandQueue = xQueueCreate(16, sizeof(CommandMessage));
+  rpcQueue = xQueueCreate(4, sizeof(RpcMessage));
   BLEDevice::init("Codex M5");
-  BLEDevice::setMTU(64);
+  BLEDevice::setMTU(128);
+  BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
   BLEServer* server = BLEDevice::createServer();
   server->setCallbacks(new ServerCallbacks());
   BLEService* service = server->createService(kServiceUuid);
   notifyCharacteristic = service->createCharacteristic(
       kNotifyUuid, BLECharacteristic::PROPERTY_NOTIFY);
-  notifyCharacteristic->addDescriptor(new BLE2902());
+  companionNotifyDescriptor = new BLE2902();
+  notifyCharacteristic->addDescriptor(companionNotifyDescriptor);
   BLECharacteristic* writeCharacteristic = service->createCharacteristic(
       kWriteUuid,
-      BLECharacteristic::PROPERTY_WRITE |
-          BLECharacteristic::PROPERTY_WRITE_NR);
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
   writeCharacteristic->setCallbacks(new CommandCallbacks());
   service->start();
+  codexHid.begin(server, enqueueCodexRpc);
+
+  auto* security = new BLESecurity();
+  security->setAuthenticationMode(ESP_LE_AUTH_BOND);
+  security->setCapability(ESP_IO_CAP_NONE);
+  security->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
 
   BLEAdvertising* advertising = BLEDevice::getAdvertising();
   advertising->addServiceUUID(kServiceUuid);
+  advertising->addServiceUUID(BLEUUID(static_cast<uint16_t>(0x1812)));
+  advertising->setAppearance(0x03c0);
   advertising->setScanResponse(true);
   advertising->setMinPreferred(0x06);
   advertising->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
+  rideBridge.begin(&codexHid, emitLine);
 }
 
 }  // namespace
@@ -448,20 +782,49 @@ void setup() {
   M5.Mic.begin();
   drawDashboard();
   startBluetooth();
-  Serial.println(F("READY M5 0.3"));
+  Serial.printf("READY M5 %s\n", kCodexM5FirmwareVersion);
 }
 
 void loop() {
   M5.update();
   pollSerial();
   pollBleCommands();
+  pollCodexRpc();
+  rideBridge.poll();
+  if (voiceSubmitPending) {
+    voiceSubmitPending = false;
+    if (codexHid.press("ACT12")) {
+      Serial.println(F("CODEX VOICE COMPLETED -> ACT12 SUBMIT"));
+    } else {
+      Serial.println(F("CODEX VOICE ACT12 SUBMIT FAILED"));
+    }
+  }
+  if (voiceState == VoiceState::Completed &&
+      millis() - voiceCompletedAtMs >= 1000) {
+    voiceState = VoiceState::Idle;
+    voiceButton.observedIdle();
+    screenDirty = true;
+  }
+  const uint32_t voiceElapsedMs = millis() - voiceStateChangedAtMs;
+  if (voiceState == VoiceState::Processing &&
+      voiceElapsedMs >= kVoiceProcessingTimeoutMs) {
+    Serial.println(F("CODEX VOICE PROCESSING TIMEOUT"));
+    resetVoiceState();
+  }
+  if (doneUntilMs != 0 &&
+      static_cast<int32_t>(millis() - doneUntilMs) >= 0) {
+    doneUntilMs = 0;
+    screenDirty = true;
+  }
   if (screenDirty) {
     screenDirty = false;
     drawDashboard();
   }
   if (announceReady) {
     announceReady = false;
-    emitLine("READY M5 0.3");
+    char ready[32]{};
+    snprintf(ready, sizeof(ready), "READY M5 %s", kCodexM5FirmwareVersion);
+    emitLine(ready);
   }
   emitButtons();
   pollMicrophone();
