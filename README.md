@@ -2,6 +2,8 @@
 
 Physical controls and status feedback for Codex.
 
+<img width="475" height="717" alt="Screenshot 2026-07-19 at 17 02 14" src="https://github.com/user-attachments/assets/f1d1c7dc-ffbb-43a7-9b29-0fede79c1d04" />
+
 ## Hardware paths
 
 ```text
